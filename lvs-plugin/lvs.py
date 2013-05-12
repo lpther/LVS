@@ -30,6 +30,230 @@ class LVS(sysadmintoolkit.plugin.Plugin):
     def __init__(self, logger, config):
         super(LVS, self).__init__('lvs', logger, config)
 
+        ret, out = sysadmintoolkit.utils.get_status_output('which ipvsadm')
+        if ret is not 0:
+            raise sysadmintoolkit.exception.PluginError('Critical error in lvs plugin: ipvsadm command could not be found', errno=201)
+
+        ret, out = sysadmintoolkit.utils.get_status_output('ipvsadm -L --daemon')
+        if out is not '':
+            self.syncid = out.splitlines()[0].split('syncid=')[-1].split(')')[0]
+            self.sync_int = out.splitlines()[0].split('mcast=')[-1].split(',')[0]
+        else:
+            self.syncid = None
+            self.sync_int = None
+
+        self.name_resolution = config['name-resolution'].lower() in ['yes']
+
+        self.virtual_servers = {}
+        self.real_servers = {}
+
+        self.refresh_vs_and_rs_cache()
+
+        self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs', self, self.debug))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_all_virtual_servers))
+
+    def refresh_vs_and_rs_cache(self):
+        self.logger.debug('Refreshing vistual/real server cache')
+        self.virtual_servers = {}
+        self.real_servers = {}
+
+        for virtual_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-A')[1].splitlines():
+            vs = VirtualService(virtual_server_config)
+
+            if vs.l3_addr not in self.virtual_servers:
+                self.virtual_servers[vs.l3_addr] = {'services': {}, 'l3_addr': vs.l3_addr}
+
+            self.logger.debug('Adding virtual service %s to the cache' % str(vs).upper())
+
+            self.virtual_servers[vs.l3_addr]['services']['%s:%s' % (vs.l4_port, vs.l4_proto)] = vs
+
+        for real_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-a')[1].splitlines():
+            rs = RealService(real_server_config)
+
+            if rs.l3_addr not in self.real_servers:
+                self.real_servers[rs.l3_addr] = {'services': {}, 'l3_addr': rs.l3_addr}
+
+            rs.set_vs(self.virtual_servers[rs.vs_l3_addr]['services']['%s:%s' % (rs.vs_l4_port, rs.l4_proto)])
+            self.virtual_servers[rs.vs_l3_addr]['services']['%s:%s' % (rs.vs_l4_port, rs.l4_proto)].add_rs(rs)
+
+            self.logger.debug('Adding real service %s to the cache' % str(rs).upper())
+
+            self.real_servers[rs.l3_addr]['services']['%s:%s' % (rs.l4_port, rs.l4_proto)] = rs
+
+        self.refresh_dns_cache()
+
+    def refresh_dns_cache(self):
+        if self.name_resolution:
+            dns_names = {}
+
+            vs_l3_addrs = self.virtual_servers.keys()
+            vs_l3_addrs.sort()
+
+            for vs_l3_addr in vs_l3_addrs:
+                try:
+                    dns_name = socket.gethostbyaddr(vs_l3_addr)[0].split('.')[0]
+                except:
+                    continue
+
+                if dns_name not in dns_names:
+                    dns_names[dns_name] = []
+
+                dns_names[dns_name].append(self.virtual_servers[vs_l3_addr])
+
+            for dns_name in dns_names:
+                if len(dns_names[dns_name]) is 1:
+                    self.virtual_servers[dns_name] = dns_names[dns_name][0]
+                else:
+                    for index in range(len(dns_names[dns_name])):
+                        self.virtual_servers['%s-vip%s' % (dns_name, index + 1)] = dns_names[dns_name][index]
+
+            rs_l3_addrs = self.real_servers.keys()
+            rs_l3_addrs.sort()
+
+            for rs_l3_addr in rs_l3_addrs:
+                try:
+                    dns_name = socket.gethostbyaddr(rs_l3_addr)[0].split('.')[0]
+                except:
+                    self.real_servers[rs_l3_addr] = 'unknown'
+                    continue
+
+                self.real_servers[dns_name] = self.real_servers[rs_l3_addr]
+                self.real_servers[dns_name]['dns_name'] = dns_name
+
+    def print_virtual_server_mapping(self, virtual_server):
+        if virtual_server not in self.virtual_servers:
+            self.logger.warning('Unknown virtual server %s' % virtual_server)
+            print 'Unknown virtual server!'
+            return 1
+
+        vs_string = '    %s' % virtual_server
+        
+        if self.name_resolution:
+            vs_string = '%s (%s)' % (vs_string, self.virtual_servers[virtual_server]['l3_addr'])
+            
+        print '%s:' % vs_string
+        print
+
+        service_keys = self.virtual_servers[virtual_server]['services'].keys()
+        service_keys.sort()
+
+        for service in service_keys:
+            vs_object = self.virtual_servers[virtual_server]['services'][service]
+            real_server_services_keys = vs_object.rs.keys()
+            real_server_services_keys.sort()
+
+            for i in range(len(real_server_services_keys)):
+                if i is 0:
+                    if self.name_resolution:
+                        port = service.split(':')[0]
+                        proto = service.split(':')[1]
+                        portname = sysadmintoolkit.utils.get_l4_portname(int(port), proto.lower())
+                        service_desc_str = '%s/%s/%s' % (portname, port, proto)
+                        service_str = '      %s' % (service_desc_str.rjust(20))
+                    else:
+                        service_str = '      %s' % (service.upper().rjust(9).replace(':', '/'))
+
+                    print '%s %s' % (service_str, vs_object.lb_algo.rjust(5)),
+                else:
+                    print ' ' * len('%s %s' % (service_str, vs_object.lb_algo.rjust(5))),
+
+                print '->',
+
+                rs_object = self.virtual_servers[virtual_server]['services'][service].rs[real_server_services_keys[i]]
+
+                if self.name_resolution:
+                    rs_prefix = '%s/' % self.real_servers[rs_object.l3_addr]['dns_name'].rjust(13)
+                else:
+                    rs_prefix = ''
+
+                if rs_object.weight is 0:
+                    state = 'failed'
+                elif rs_object.weight is 1:
+                    state = 'active'
+                else:
+                    state = 'active  weight:%s' % rs_object.weight
+
+                print '%s%s:%s %s  %s' % (rs_prefix, rs_object.l3_addr.rjust(15), rs_object.l4_port.ljust(5), \
+                                         rs_object.fwding_method.lower().ljust(6), state)
+
+            print
+
+    # Sysadmin-toolkit commands
+
+    def display_all_virtual_servers(self, line, mode):
+        '''
+        Displays virtual servers to real servers mapping
+        '''
+        virtual_servers_keys = self.virtual_servers.keys()
+        virtual_servers_keys.sort()
+
+        for virtual_server in virtual_servers_keys:
+            # Skip if the name of the VS has a dot, which means it's an IPV4 address
+            if self.name_resolution and '.' not in virtual_server:
+                self.print_virtual_server_mapping(virtual_server)
+
+    def display_virtual_server(self, line, mode):
+        '''
+        Displays Virtual Server information
+        '''
+        print '  displaying virtual server information'
+        print
+
+    def debug(self, line, mode):
+        '''
+        Displays LVS configuration and state
+        '''
+        print 'LVS plugin configuration and state:'
+        print
+        print '  LVS plugin version: %s' % __version__
+        print '  ipvsadm version: %s' % sysadmintoolkit.utils.get_status_output('ipvsadm -v')[1]
+        print
+        print '  Name resolution: %s' % self.name_resolution
+        print '  Clustering support: %s' % ('clustering' in self.plugin_set.get_plugins())
+        print
+
+        if self.syncid:
+            print '  Connection synchronization information:'
+            print '    syncid: %s' % self.syncid
+            print '    mcast interface: %s' % self.sync_int
+        else:
+            print '  No connection synchronization support'
+        print
+
+# ----- LVS plugin classes -----
+
+l4_proto_map = {'-t':'tcp', '-u':'udp', '-f':'fwmark'}
+packet_forwarding_method = {'-m': 'MASQ', '-g': 'DROUTE', '-i': 'TUNNEL'}
+
+class VirtualService(object):
+    def __init__(self, ipvsadm_config_line):
+        self.l3_addr, self.l4_port = tuple(ipvsadm_config_line.split()[2].split(':'))
+        self.l4_proto = l4_proto_map[ipvsadm_config_line.split()[1]]
+        self.lb_algo = ipvsadm_config_line.split()[4]
+        self.rs = {}
+
+    def add_rs(self, rs_object):
+        self.rs['%s:%s:%s' % (rs_object.l3_addr, rs_object.l4_port, rs_object.l4_proto)] = rs_object
+
+    def __str__(self):
+        return '%s:%s %s %s' % (self.l3_addr, self.l4_port, self.l4_proto, self.lb_algo)
+
+class RealService(object):
+    def __init__(self, ipvsadm_config_line):
+        self.vs_l3_addr, self.vs_l4_port = tuple(ipvsadm_config_line.split()[2].split(':'))
+        self.l3_addr, self.l4_port = tuple(ipvsadm_config_line.split()[4].split(':'))
+        self.l4_proto = l4_proto_map[ipvsadm_config_line.split()[1]]
+        self.fwding_method = packet_forwarding_method[ipvsadm_config_line.split()[5]]
+        self.weight = int(ipvsadm_config_line.split()[7])
+        self.vs_object = None
+
+    def set_vs(self, vs_object):
+        self.vs_object = vs_object
+
+    def __str__(self):
+        return '%s:%s -> %s:%s %s %s %s' % (self.vs_l3_addr, self.vs_l4_port, self.l3_addr.rjust(15), self.l4_port.ljust(5), \
+                                            self.l4_proto.ljust(5), self.fwding_method.ljust(6), str(self.weight).rjust(3))
+
 # ----- LVSSYNC Library -----
 
 # lvssync constants
