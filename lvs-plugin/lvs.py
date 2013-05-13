@@ -50,7 +50,11 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         self.refresh_vs_and_rs_cache()
 
         self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs', self, self.debug))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_all_virtual_servers))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_virtual_servers_mapping))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server', self, self.display_virtual_server_cmd))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server <virtual-server>', self, self.display_virtual_server_cmd))
+
+        self.add_dynamic_keyword_fn('<virtual-server>', self.get_virtual_servers)
 
     def refresh_vs_and_rs_cache(self):
         self.logger.debug('Refreshing vistual/real server cache')
@@ -127,10 +131,10 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             return 1
 
         vs_string = '    %s' % virtual_server
-        
+
         if self.name_resolution:
             vs_string = '%s (%s)' % (vs_string, self.virtual_servers[virtual_server]['l3_addr'])
-            
+
         print '%s:' % vs_string
         print
 
@@ -178,9 +182,84 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             print
 
+    def display_virtual_server(self, virtual_server):
+        self.logger.debug('Displaying virtual server %s' % (virtual_server))
+
+        vs_string = '    %s' % virtual_server
+
+        if self.name_resolution:
+            vs_string = '%s   IP: %s' % (vs_string.ljust(20), self.virtual_servers[virtual_server]['l3_addr'].rjust(15))
+
+        print '%s' % vs_string,
+
+        if not sysadmintoolkit.utils.is_ipv4_addr(virtual_server):
+            vs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(self.virtual_servers[virtual_server]['l3_addr'])
+        else:
+            vs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(virtual_server)
+
+        tot_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^[A-Z]* [A-F,0-9]* [A-F,0-9]* %s" /proc/net/ip_vs_conn' % vs_ip_hex)[1]
+        print '        Total Connections: %s' % tot_conns
+
+        service_keys = self.virtual_servers[virtual_server]['services'].keys()
+        service_keys.sort()
+
+        for service in service_keys:
+            vs_object = self.virtual_servers[virtual_server]['services'][service]
+
+            port = service.split(':')[0]
+            proto = service.split(':')[1]
+
+            if self.name_resolution:
+                portname = sysadmintoolkit.utils.get_l4_portname(int(port), proto.lower())
+                service_desc_str = '%s/%s/%s' % (portname, port, proto)
+                service_str = '      %s' % (service_desc_str.rjust(20))
+            else:
+                service_str = '      %s' % (service.upper().rjust(9).replace(':', '/'))
+
+            print '%s             Scheduler: %s' % (service_str, lb_algo_map[vs_object.lb_algo].rjust(5)),
+
+            l4_port_hex = sysadmintoolkit.utils.get_hexstr_from_l4_port(vs_object.l4_port)
+
+            conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s" /proc/net/ip_vs_conn' % \
+                                                            (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
+            print '        Connections: %s' % conns
+
+            est_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* ESTABLISHED" /proc/net/ip_vs_conn' % \
+                                                                (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
+            closed_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* CLOSE" /proc/net/ip_vs_conn' % \
+                                                                   (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
+            finw_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* FIN_WAIT" /proc/net/ip_vs_conn' % \
+                                                                 (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
+
+            print
+            print '%s Established: %s' % (' ' * len(service_str), est_conns)
+            print '%s     Closing: %s' % (' ' * len(service_str), closed_conns)
+            print '%s    Fin-Wait: %s' % (' ' * len(service_str), finw_conns)
+
+            print
+
+    # Dynamic keywords
+
+    def get_virtual_servers(self, dyn_keyword=None):
+        '''
+        Returns the list of virtual servers
+        '''
+        virtual_servers = self.virtual_servers.keys()
+        virtual_servers.sort()
+
+        vsmap = {}
+
+        for vs in virtual_servers:
+            if not sysadmintoolkit.utils.is_ipv4_addr(vs):
+                vsmap[vs] = 'Virtual server %s' % self.virtual_servers[vs]['l3_addr']
+            else:
+                vsmap[vs] = 'Virtual server'
+
+        return vsmap
+
     # Sysadmin-toolkit commands
 
-    def display_all_virtual_servers(self, line, mode):
+    def display_virtual_servers_mapping(self, line, mode):
         '''
         Displays virtual servers to real servers mapping
         '''
@@ -188,16 +267,27 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         virtual_servers_keys.sort()
 
         for virtual_server in virtual_servers_keys:
-            # Skip if the name of the VS has a dot, which means it's an IPV4 address
-            if self.name_resolution and '.' not in virtual_server:
-                self.print_virtual_server_mapping(virtual_server)
+            if self.name_resolution and sysadmintoolkit.utils.is_ipv4_addr(virtual_server):
+                continue
 
-    def display_virtual_server(self, line, mode):
+            self.print_virtual_server_mapping(virtual_server)
+
+    def display_virtual_server_cmd(self, line, mode):
         '''
         Displays Virtual Server information
         '''
-        print '  displaying virtual server information'
-        print
+
+        if 'virtual-server' == line.split()[-1]:
+            virtual_servers_keys = self.virtual_servers.keys()
+            virtual_servers_keys.sort()
+        else:
+            virtual_servers_keys = [line.split()[line.split().index('virtual-server') + 1]]
+
+        for vs in virtual_servers_keys:
+            if self.name_resolution and sysadmintoolkit.utils.is_ipv4_addr(vs):
+                continue
+
+            self.display_virtual_server(vs)
 
     def debug(self, line, mode):
         '''
@@ -223,6 +313,10 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 # ----- LVS plugin classes -----
 
 l4_proto_map = {'-t':'tcp', '-u':'udp', '-f':'fwmark'}
+lb_algo_map = {'rr': 'Robin Robin', 'wrr': 'Weighted Round Robin', 'lc': 'Least-Connection', 'wlc': 'Weighted Least-Connection', \
+               'lblc': 'Locality-Based Least-Connection', 'lblcr': 'Locality-Based Least-Connection with Replication', \
+               'dh': 'Destination Hashing', 'sh': 'Source Hashing', 'sed': 'Shortest Expected Delay', \
+               'nq': 'Never Queue' }
 packet_forwarding_method = {'-m': 'MASQ', '-g': 'DROUTE', '-i': 'TUNNEL'}
 
 class VirtualService(object):
