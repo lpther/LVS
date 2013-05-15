@@ -9,6 +9,8 @@ import struct
 import string
 import sys
 import time
+import re
+import signal
 
 global plugin_instance
 
@@ -30,19 +32,22 @@ class LVS(sysadmintoolkit.plugin.Plugin):
     def __init__(self, logger, config):
         super(LVS, self).__init__('lvs', logger, config)
 
-        ret, out = sysadmintoolkit.utils.get_status_output('which ipvsadm')
+        ret, out = sysadmintoolkit.utils.get_status_output('which ipvsadm', self.logger)
         if ret is not 0:
             raise sysadmintoolkit.exception.PluginError('Critical error in lvs plugin: ipvsadm command could not be found', errno=201)
 
-        ret, out = sysadmintoolkit.utils.get_status_output('ipvsadm -L --daemon')
+        self.name_resolution = config['name-resolution'].lower() in ['yes']
+
+        ret, out = sysadmintoolkit.utils.get_status_output('ipvsadm -L --daemon', self.logger)
         if out is not '':
             self.syncid = out.splitlines()[0].split('syncid=')[-1].split(')')[0]
             self.sync_int = out.splitlines()[0].split('mcast=')[-1].split(',')[0]
+            self.sync_version = sysadmintoolkit.utils.get_status_output('cat /proc/sys/net/ipv4/vs/sync_version', self.logger)[1].strip()
+            self.ipvssync = IPVSSync(self.syncid, self.logger, self.name_resolution, interface=self.sync_int, sync_protocol_version=self.sync_version)
         else:
             self.syncid = None
             self.sync_int = None
-
-        self.name_resolution = config['name-resolution'].lower() in ['yes']
+            self.ipvssync = None
 
         self.virtual_servers = {}
         self.real_servers = {}
@@ -53,15 +58,28 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_virtual_servers_mapping))
         self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server', self, self.display_virtual_server_cmd))
         self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server <virtual-server>', self, self.display_virtual_server_cmd))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server', self, self.display_real_server_cmd))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server <real-server>', self, self.display_real_server_cmd))
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs connections', self, self.display_connections_cmd))
 
         self.add_dynamic_keyword_fn('<virtual-server>', self.get_virtual_servers)
+        self.add_dynamic_keyword_fn('<real-server>', self.get_real_servers)
+
+        if self.syncid:
+            self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs lvssync', self, self.debug_lvs_sync))
+
+    def update_plugin_set(self, plugin_set):
+        super(LVS, self).update_plugin_set(plugin_set)
+
+        if 'clustering' in self.plugin_set.get_plugins():
+            self.add_command(sysadmintoolkit.command.ExecCommand('show cluster loadbalancer lvs out-of-sync-connections', self, self.display_connections_cmd))
 
     def refresh_vs_and_rs_cache(self):
-        self.logger.debug('Refreshing vistual/real server cache')
+        self.logger.debug('Refreshing virtual/real server cache')
         self.virtual_servers = {}
         self.real_servers = {}
 
-        for virtual_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-A')[1].splitlines():
+        for virtual_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-A', self.logger)[1].splitlines():
             vs = VirtualService(virtual_server_config)
 
             if vs.l3_addr not in self.virtual_servers:
@@ -71,7 +89,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             self.virtual_servers[vs.l3_addr]['services']['%s:%s' % (vs.l4_port, vs.l4_proto)] = vs
 
-        for real_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-a')[1].splitlines():
+        for real_server_config in sysadmintoolkit.utils.get_status_output('ipvsadm -S -n | grep ^-a', self.logger)[1].splitlines():
             rs = RealService(real_server_config)
 
             if rs.l3_addr not in self.real_servers:
@@ -82,7 +100,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             self.logger.debug('Adding real service %s to the cache' % str(rs).upper())
 
-            self.real_servers[rs.l3_addr]['services']['%s:%s' % (rs.l4_port, rs.l4_proto)] = rs
+            self.real_servers[rs.l3_addr]['services']['%s:%s:%s:%s' % (rs.l4_port, rs.l4_proto, rs.vs_l3_addr, rs.vs_l4_port)] = rs
 
         self.refresh_dns_cache()
 
@@ -182,7 +200,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             print
 
-    def display_virtual_server(self, virtual_server):
+    def display_virtual_server(self, virtual_server, connections):
         self.logger.debug('Displaying virtual server %s' % (virtual_server))
 
         vs_string = '    %s' % virtual_server
@@ -197,8 +215,10 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         else:
             vs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(virtual_server)
 
-        tot_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^[A-Z]* [A-F,0-9]* [A-F,0-9]* %s" /proc/net/ip_vs_conn' % vs_ip_hex)[1]
-        print '        Total Connections: %s' % tot_conns
+        vs_connections = re.findall(r"^[A-Z]* [A-F,0-9]* [A-F,0-9]* %s .*" % vs_ip_hex, connections, re.MULTILINE)
+
+        print '        Total Connections: %s' % len(vs_connections)
+        print
 
         service_keys = self.virtual_servers[virtual_server]['services'].keys()
         service_keys.sort()
@@ -209,6 +229,8 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             port = service.split(':')[0]
             proto = service.split(':')[1]
 
+            l4_port_hex = sysadmintoolkit.utils.get_hexstr_from_l4_port(vs_object.l4_port)
+
             if self.name_resolution:
                 portname = sysadmintoolkit.utils.get_l4_portname(int(port), proto.lower())
                 service_desc_str = '%s/%s/%s' % (portname, port, proto)
@@ -218,24 +240,84 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             print '%s             Scheduler: %s' % (service_str, lb_algo_map[vs_object.lb_algo].rjust(5)),
 
-            l4_port_hex = sysadmintoolkit.utils.get_hexstr_from_l4_port(vs_object.l4_port)
+            service_connections = re.findall("^%s [A-F,0-9]* [A-F,0-9]* %s %s .*" % \
+                                             (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex), '\n'.join(vs_connections), re.MULTILINE)
 
-            conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s" /proc/net/ip_vs_conn' % \
-                                                            (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
-            print '        Connections: %s' % conns
+            print '        Connections: %s' % len(service_connections)
 
-            est_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* ESTABLISHED" /proc/net/ip_vs_conn' % \
-                                                                (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
-            closed_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* CLOSE" /proc/net/ip_vs_conn' % \
-                                                                   (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
-            finw_conns = sysadmintoolkit.utils.get_status_output('egrep -c -E "^%s [A-F,0-9]* [A-F,0-9]* %s %s .* FIN_WAIT" /proc/net/ip_vs_conn' % \
-                                                                 (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex))[1].strip()
+            est_connections = re.findall("^%s [A-F,0-9]* [A-F,0-9]* %s %s .* ESTABLISHED" % \
+                                             (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
+            finw_connections = re.findall("^%s [A-F,0-9]* [A-F,0-9]* %s %s .* FIN_WAIT" % \
+                                             (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
+            closed_connections = re.findall("^%s [A-F,0-9]* [A-F,0-9]* %s %s .* CLOSE" % \
+                                             (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
 
             print
-            print '%s Established: %s' % (' ' * len(service_str), est_conns)
-            print '%s     Closing: %s' % (' ' * len(service_str), closed_conns)
-            print '%s    Fin-Wait: %s' % (' ' * len(service_str), finw_conns)
+            print '%s Established: %s' % (' ' * len(service_str), len(est_connections))
+            print '%s    Fin-Wait: %s' % (' ' * len(service_str), len(finw_connections))
+            print '%s     Closing: %s' % (' ' * len(service_str), len(closed_connections))
+            print
 
+    def display_real_server(self, real_server, connections):
+        self.logger.debug('Displaying real server %s' % (real_server))
+
+        rs_string = '    %s' % real_server
+
+        if self.name_resolution:
+            rs_string = '%s   IP: %s' % (rs_string.ljust(20), self.real_servers[real_server]['l3_addr'].rjust(15))
+
+        print '%s' % rs_string,
+
+        if not sysadmintoolkit.utils.is_ipv4_addr(real_server):
+            rs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(self.real_servers[real_server]['l3_addr'])
+        else:
+            rs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(real_server)
+
+        rs_connections = re.findall(r"^[A-Z]* [A-F,0-9]* [A-F,0-9]* [A-F,0-9]* [A-F,0-9]* %s .*" % rs_ip_hex, connections, re.MULTILINE)
+
+        print '        Total Connections: %s' % len(rs_connections)
+        print
+
+        service_keys = self.real_servers[real_server]['services'].keys()
+        service_keys.sort()
+
+        for service in service_keys:
+            rs_object = self.real_servers[real_server]['services'][service]
+
+            port = service.split(':')[0]
+            proto = service.split(':')[1]
+            vs_l3_addr = service.split(':')[2]
+            vs_l4_port = service.split(':')[3]
+
+            l4_port_hex = sysadmintoolkit.utils.get_hexstr_from_l4_port(rs_object.l4_port)
+            vs_ip_hex = sysadmintoolkit.utils.get_hexstr_from_ipv4_addr(vs_l3_addr)
+            vs_l4_port_hex = sysadmintoolkit.utils.get_hexstr_from_l4_port(vs_l4_port)
+
+            if self.name_resolution:
+                portname = sysadmintoolkit.utils.get_l4_portname(int(port), proto.lower())
+                service_desc_str = '%s/%s/%s' % (portname, port, proto)
+                service_str = '      %s             ' % (service_desc_str.rjust(20))
+            else:
+                service_str = '      %s             ' % (service.upper().rjust(9).replace(':', '/'))
+
+            service_connections = re.findall(r"^%s [A-F,0-9]* [A-F,0-9]* %s %s %s %s .*" % \
+                                             (rs_object.l4_proto.upper(), vs_ip_hex, vs_l4_port_hex, rs_ip_hex, vs_l4_port_hex), '\n'.join(rs_connections), re.MULTILINE)
+
+            print '%s Virtual Server: %s:%s  Connections: %s' % (service_str, vs_l3_addr.rjust(15), vs_l4_port.ljust(5), len(service_connections))
+            print
+            print '%s Weight:%s  Forwarding Method: %s' % (' ' * len(service_str), str(rs_object.weight).ljust(5), packet_forwarding_method_desc[rs_object.fwding_method])
+
+            est_connections = re.findall(r"^%s [A-F,0-9]* [A-F,0-9]* %s %s %s %s ESTABLISHED" % \
+                                             (rs_object.l4_proto.upper(), vs_ip_hex, vs_l4_port_hex, rs_ip_hex, vs_l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
+            finw_connections = re.findall(r"^%s [A-F,0-9]* [A-F,0-9]* %s %s %s %s FIN_WAIT" % \
+                                             (rs_object.l4_proto.upper(), vs_ip_hex, vs_l4_port_hex, rs_ip_hex, vs_l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
+            closed_connections = re.findall(r"^%s [A-F,0-9]* [A-F,0-9]* %s %s %s %s CLOSE" % \
+                                             (rs_object.l4_proto.upper(), vs_ip_hex, vs_l4_port_hex, rs_ip_hex, vs_l4_port_hex), '\n'.join(service_connections), re.MULTILINE)
+
+            print
+            print '%s Established: %s' % (' ' * len(service_str), len(est_connections))
+            print '%s    Fin-Wait: %s' % (' ' * len(service_str), len(finw_connections))
+            print '%s     Closing: %s' % (' ' * len(service_str), len(closed_connections))
             print
 
     # Dynamic keywords
@@ -257,7 +339,31 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         return vsmap
 
+    def get_real_servers(self, dyn_keyword=None):
+        '''
+        Returns the list of real servers
+        '''
+        real_servers = self.real_servers.keys()
+        real_servers.sort()
+
+        rsmap = {}
+
+        for rs in real_servers:
+            if not sysadmintoolkit.utils.is_ipv4_addr(rs):
+                rsmap[rs] = 'Real server %s' % self.real_servers[rs]['l3_addr']
+            else:
+                rsmap[rs] = 'Real server'
+
+        return rsmap
+
     # Sysadmin-toolkit commands
+
+    def display_connections_cmd(self, line, mode):
+        '''
+        Displays connection table
+        '''
+        print sysadmintoolkit.utils.get_status_output('ipvsadm -L -n -c', self.logger)[1]
+
 
     def display_virtual_servers_mapping(self, line, mode):
         '''
@@ -283,11 +389,35 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         else:
             virtual_servers_keys = [line.split()[line.split().index('virtual-server') + 1]]
 
+        connections = sysadmintoolkit.utils.get_status_output('grep -v ^Pro /proc/net/ip_vs_conn', self.logger)[1]
+
         for vs in virtual_servers_keys:
             if self.name_resolution and sysadmintoolkit.utils.is_ipv4_addr(vs):
                 continue
 
-            self.display_virtual_server(vs)
+            self.display_virtual_server(vs, connections)
+            print
+
+    def display_real_server_cmd(self, line, mode):
+        '''
+        Displays Real Server information
+        '''
+
+        if 'real-server' == line.split()[-1]:
+            real_servers_keys = self.real_servers.keys()
+            real_servers_keys.sort()
+        else:
+            real_servers_keys = [line.split()[line.split().index('real-server') + 1]]
+
+        connections = sysadmintoolkit.utils.get_status_output('grep -v ^Pro /proc/net/ip_vs_conn', self.logger)[1]
+
+        for rs in real_servers_keys:
+            if self.name_resolution and sysadmintoolkit.utils.is_ipv4_addr(rs):
+                continue
+
+            self.display_real_server(rs, connections)
+            print
+
 
     def debug(self, line, mode):
         '''
@@ -296,7 +426,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         print 'LVS plugin configuration and state:'
         print
         print '  LVS plugin version: %s' % __version__
-        print '  ipvsadm version: %s' % sysadmintoolkit.utils.get_status_output('ipvsadm -v')[1]
+        print '  ipvsadm version: %s' % sysadmintoolkit.utils.get_status_output('ipvsadm -v', self.logger)[1]
         print
         print '  Name resolution: %s' % self.name_resolution
         print '  Clustering support: %s' % ('clustering' in self.plugin_set.get_plugins())
@@ -304,11 +434,29 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         if self.syncid:
             print '  Connection synchronization information:'
-            print '    syncid: %s' % self.syncid
+            print '       sync version: %s' % self.sync_version
+            print '             syncid: %s' % self.syncid
             print '    mcast interface: %s' % self.sync_int
         else:
             print '  No connection synchronization support'
         print
+
+    def debug_lvs_sync(self, line, mode):
+        '''
+        Dump all LVS Sync packets seen on the Sync Daemon interface
+        '''
+        def sigint_handler(signum, frame):
+            raise KeyboardInterrupt
+
+        old_sigint_action = signal.signal(signal.SIGINT, sigint_handler)
+
+        try:
+            print 'Displaying lvs sync connections seen on interface %s:' % self.sync_int
+            self.ipvssync.debug()
+
+        finally:
+            signal.signal(signal.SIGINT, old_sigint_action)
+
 
 # ----- LVS plugin classes -----
 
@@ -318,6 +466,7 @@ lb_algo_map = {'rr': 'Robin Robin', 'wrr': 'Weighted Round Robin', 'lc': 'Least-
                'dh': 'Destination Hashing', 'sh': 'Source Hashing', 'sed': 'Shortest Expected Delay', \
                'nq': 'Never Queue' }
 packet_forwarding_method = {'-m': 'MASQ', '-g': 'DROUTE', '-i': 'TUNNEL'}
+packet_forwarding_method_desc = {'MASQ': 'NAT (Masquerading)', 'DROUTE': 'Direct Routing (Gatewaying)', 'TUNNEL': 'Tunneling (IP-IP Encapsulation)'}
 
 class VirtualService(object):
     def __init__(self, ipvsadm_config_line):
@@ -353,7 +502,6 @@ class RealService(object):
 # lvssync constants
 LVSSYNC_MIN_SLEEP = 0.25  # In debugging mode, how much time to sleep before checking the buffer
 LVSSYNC_FQDN_NR = False  # Set to True for fully qualified name resolution
-LVSSYNC_DEBUG_TIME_FMT = '%c'  # To prefix debugging entries
 
 # ip_vs_sync constants
 MCAST_GRP = '224.0.0.81'
@@ -389,6 +537,177 @@ IP_VS_F_BOOL = [IP_VS_CONN_F_SYNC, IP_VS_CONN_F_HASHED, IP_VS_CONN_F_NOOUTPUT, I
 # other constants
 SIOCGIFADDR = 0x8915
 
+class SyncConnectionHeader(object):
+    def __init__(self, logger, socket_buffer=None):
+        self.initialized = False
+
+        self.logger = logger
+
+        self.size = None
+        self.reserved = None
+        self.syncid = None
+        self.nr_conns = None
+        self.version = None
+        self.spare = None
+
+        if socket_buffer:
+            self.decode_from_socket(socket_buffer)
+            self.logger.debug('Decoded head from socket buffer: %s' % self)
+
+    def __str__(self):
+        return str(self.syncid).center(6)
+
+    def decode_from_socket(self, socket_buffer):
+        reserved , syncid , rawsize , nr_conns, version, spare = struct.unpack('BBHBbH', socket_buffer[0:IP_VS_CONN_HDRLEN])
+
+        self.size = socket.ntohs(rawsize)
+        self.reserved = reserved
+        self.syncid = syncid
+        self.nr_conns = nr_conns
+        self.version = version
+        self.spare = spare
+
+        self.initialized = True
+
+class SyncConnection(object):
+    def __init__(self, logger, name_resolution, ipvsadm_conn_str=None, socket_buffer=None):
+        self.initialized = False
+
+        self.logger = logger
+        self.name_resolution = name_resolution
+
+        self.type = None
+        self.protocol = None
+        self.version = None
+        self.size = None
+        self.flags = None
+        self.state = None
+        self.cport = None
+        self.vport = None
+        self.dport = None
+        self.timeout = None
+        self.caddr = None
+        self.vaddr = None
+        self.daddr = None
+
+        if socket_buffer:
+            self.decode_from_socket(socket_buffer)
+            self.logger.debug('Decoded connection from socket buffer: %s' % self)
+
+    def __str__(self):
+        # Get protocol name
+        if self.protocol is socket.SOL_TCP:
+            protocol_str = 'TCP'
+
+        elif self.protocol is socket.SOL_UDP:
+            protocol_str = 'UDP'
+
+        else:
+            protocol_str = str(self.protocol)
+
+        # Get expiration format
+        expire = '%3d:%2s' % (self.timeout / 60, str(self.timeout % 60).zfill(2))
+
+        # Get s/v/d client:protocol pair
+        caddr, vaddr , daddr = (self.caddr, self.vaddr, self.daddr)
+        addrspacer = ''
+
+        if self.name_resolution:
+            addrspacer = ' '
+            try:
+                caddr = socket.gethostbyaddr(caddr)[0]
+
+                if not LVSSYNC_FQDN_NR:
+                    caddr = caddr.split('.')[0]
+            except:
+                pass
+
+            try:
+                vaddr = socket.gethostbyaddr(vaddr)[0]
+
+                if not LVSSYNC_FQDN_NR:
+                    vaddr = vaddr.split('.')[0]
+            except:
+                pass
+
+            try:
+                daddr = socket.gethostbyaddr(daddr)[0]
+
+                if not LVSSYNC_FQDN_NR:
+                    daddr = daddr.split('.')[0]
+            except:
+                pass
+
+        source = '%s:%s' % (caddr, self.cport) + addrspacer
+        virtual = '%s:%s' % (vaddr, self.vport) + addrspacer
+        destination = '%s:%s' % (daddr, self.dport) + addrspacer
+
+        return '%s%s%s%s%s%s%s' % (string.center(protocol_str, 4), string.center(expire, 7), \
+                                                string.center(self.state, 13), string.center(source, 22), \
+                                                string.center(virtual, 22), string.center(destination, 22), ' '.join(self.flags))
+
+    def decode_from_socket(self, socket_buffer):
+        conn_type, protocol, ver_size, flags, state, cport, \
+        vport, dport, fwmark, timeout, caddr, vaddr, daddr = struct.unpack('BBHIHHHHIIIII', socket_buffer[:IP_VS_CONN_CONNLEN])
+
+        self.type = conn_type
+        self.protocol = protocol
+        self.version = socket.ntohs(ver_size) >> 12
+        self.size = socket.ntohs(ver_size) & 0b0000111111111111
+        self.flags = self.decode_flags(socket.ntohl(flags))
+        self.state = IP_VS_TCP_S_CONNECTION_STATES[socket.ntohs(state)]
+        self.cport = socket.ntohs(cport)
+        self.vport = socket.ntohs(vport)
+        self.dport = socket.ntohs(dport)
+        self.timeout = int(socket.ntohl(timeout))
+        self.caddr = self.unsigned_int_to_ip(socket.ntohl(caddr))
+        self.vaddr = self.unsigned_int_to_ip(socket.ntohl(vaddr))
+        self.daddr = self.unsigned_int_to_ip(socket.ntohl(daddr))
+
+        self.initialized = True
+
+    def unsigned_int_to_ip(self, unsigned_int):
+        '''
+        Returns dotted quad ip str
+        '''
+        a = (unsigned_int & 0xff000000) >> 24
+        b = (unsigned_int & 0x00ff0000) >> 16
+        c = (unsigned_int & 0x0000ff00) >> 8
+        d = unsigned_int & 0x000000ff
+        return '%s.%s.%s.%s' % (a, b, c, d)
+
+    def ip_to_unsigned_int(self, dotted_quad_ip):
+        '''
+        Returns unsigned int from dotted quad
+        '''
+        unsigned_int = 0x00000000
+        for quad_id in range(4):
+            quad = dotted_quad_ip.split('.')[quad_id]
+
+            unsigned_int += int(quad) << ((8 * (3 - quad_id)))
+
+        return unsigned_int
+
+    def decode_flags(self, rawflags):
+        flags = []
+
+        flags += [ IP_VS_F_FWD_METHOD[rawflags & 0x0007] ]
+
+        for f in IP_VS_F_BOOL:
+            if rawflags & f['flag']:
+                flags.append(f['flagname'])
+
+        return flags
+
+    def encode_flags(self, flagslist):
+        rawflags = 0x0000
+
+        for f in flagslist:
+            rawflags = rawflags | f
+
+        return rawflags
+
+
 class IPVSSync(object):
     '''
     ipvs sync library
@@ -415,45 +734,37 @@ class IPVSSync(object):
     What is not tested:
     -MASQ,TUNNEL modes
 
-    examples:
-    $ LVSSYNCMODE=testsend LVSSYNCINT=eth0 python lvssync.py
-    Sending 3 connections should take around 2 sec at 1 connections/sec
-    ... Sending time was 2.00 sec
-
-    $ LVSSYNCINT=eth0 python lvssync.py
-    Bound to 0.0.0.0:8848, joined group 224.0.0.81 on interface eth0 (192.168.1.1)
-    syncid pro  expire    state            source               virtual             destination      flags
-    ==========================================================================================================================
-    0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
-    0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
-    0      TCP    1:40 ESTABLISHED     10.1.1.1:11111        10.2.2.2:22222        10.3.3.3:33333    DROUTE NOOUTPUT
-
     Reference for packet structure:
     http://lxr.free-electrons.com/source/net/netfilter/ipvs/ip_vs_sync.c
 
-    Author: Louis-Philippe Theriault (lpther@gmail.com)
     '''
 
-    def __init__(self, syncid, interface=None):
+    def __init__(self, syncid, logger, name_resolution, interface=None, sync_protocol_version=1):
         '''
         Main class to receive or send ipvs sync connections
-        Supports only Version 1 ip_vs_sync connections
 
         interface   str     interface to bind the mcast socket
                             defaults to socket.INADDR_ANY
         syncid      int     syncid instance identifier
         '''
+        self.socket = None
+        self.recvbuffer = ''
+        self.sendbuffer = ''
+
         self.interface = interface
         self.interfaceaddress = None
         self.interfacemtu = 1500
         self.maxmcastmessage = self.interfacemtu - 68  # Safe header room for IP + UDP
-        self.syncid = syncid
-        self.socket = None
-        self.socketisblocking = None
-        self.recvbuffer = ''
-        self.sendbuffer = ''
 
-    def getsendconnlistduration(self, connlist, connspersec=250):
+        self.name_resolution = name_resolution
+
+        self.syncid = syncid
+        self.sync_protocol_version = sync_protocol_version
+        self.logger = logger
+
+        self.logger.debug('IPVSSync instance created. syncid=%s interface=%s version=%s' % (self.syncid, self.interface, self.sync_protocol_version))
+
+    def get_send_conn_list_duration(self, connlist, connspersec=250):
         '''
         Returns the number of seconds if should take to send this list of connections
         '''
@@ -462,7 +773,7 @@ class IPVSSync(object):
 
         return int(math.ceil(float(len(connlist)) / connspersec)) - 1
 
-    def sendconnlist(self, connlist, connspersec=250):
+    def send_conn_list(self, connlist, connspersec=250):
         '''
         Sends the connlist of connections to the lvs mcast group,
         to update all lvs on the network
@@ -482,7 +793,7 @@ class IPVSSync(object):
                             }
         '''
         if self.socket == None:
-            self.__initsocket()
+            self.init_socket()
 
         maxconnpermessage = int(math.floor((self.maxmcastmessage - IP_VS_CONN_HDRLEN) / IP_VS_CONN_CONNLEN))
         maxconnpermessage = min(maxconnpermessage, connspersec)
@@ -503,7 +814,7 @@ class IPVSSync(object):
                 nr_conns = min(len(connlist), maxconnpermessage)
 
                 # Generate the buffer data for the connections to send with this message
-                buffconns = self.__encode_connlist(connlist[:nr_conns])
+                buffconns = self.encode_connlist(connlist[:nr_conns])
 
                 reserved = 0
                 syncid = self.syncid
@@ -519,85 +830,66 @@ class IPVSSync(object):
                 last_sent_time = time.time()
                 connlist = connlist[nr_conns:]
 
-        self.__shutsocket()
+        self.shut_socket()
 
 
-    def debug(self, duration, fd=sys.stdout, printdate=False, nameresolution=False):
+    def debug(self):
         '''
         Binds to the ipvs sync multicast address and dumps received packets
-        to the fd during the specified time.
+        to stdout
 
-        duration    int      seconds
         '''
-        if self.socket == None:
-            self.__initsocket(blocking=False)
+        if self.socket is None:
+            self.init_socket()
 
-        self.__print_debug(fd, ['Bound to %s:%s, joined group %s on interface %s (%s)' % \
-            (self.socket.getsockname()[0], MCAST_PORT, MCAST_GRP, self.interface, self.interfaceaddress)], printdate)
+        self.logger.debug('Bound to %s:%s, joined group %s on interface %s (%s)' % \
+                          (self.socket.getsockname()[0], MCAST_PORT, MCAST_GRP, self.interface, self.interfaceaddress))
 
-        self.__print_conns_col(fd, printdate)
+        self.print_conns_columns()
 
         starttime = time.time()
         numpackets = 0
         numconnections = 0
+
         try:
             while True:
-                while True:
-                    try:
-                        newbuffer = self.socket.recv(9999)
-                    except socket.error as e:
-                        if e.errno == 11:
-                            newbuffer = ''
-                        else:
-                            raise
-
-                    if len(newbuffer) > 0:
-                        self.recvbuffer += newbuffer
-                    else:
-                        break
+                self.recvbuffer = self.socket.recv(4096)
 
                 while True:
                     if len(self.recvbuffer) >= IP_VS_CONN_HDRLEN:
-                        reserved , syncid , rawsize , nr_conns, version, spare = struct.unpack('BBHBbH', self.recvbuffer[0:IP_VS_CONN_HDRLEN])
+                        header = SyncConnectionHeader(self.logger, socket_buffer=self.recvbuffer[0:IP_VS_CONN_HDRLEN])
 
-                        # Network to host conversions
-                        size = socket.ntohs(rawsize)
-
-                        header = {}
-                        header['reserved'] = reserved
-                        header['syncid'] = syncid
-                        header['size'] = size
-                        header['nr_conns'] = nr_conns
-                        header['version'] = version
-                        header['spare'] = spare
-
-                        if len(self.recvbuffer) >= size:
-                            conns = self.__decode_conns(self.recvbuffer[IP_VS_CONN_HDRLEN:header['size']])
+                        if len(self.recvbuffer) >= header.size:
+                            connections = self.decode_conns(self.recvbuffer[IP_VS_CONN_HDRLEN:header.size])
 
                             numpackets += 1
-                            numconnections += len(conns)
+                            numconnections += len(connections)
 
-                            self.__print_conns(fd, header, conns, nameresolution=nameresolution, printdate=printdate)
+                            for connection in connections:
+                                print '%s %s' % (header, connection)
 
-                            self.recvbuffer = self.recvbuffer[header['size']:]
+                            self.recvbuffer = self.recvbuffer[header.size:]
                         else:
                             break
                     else:
                         break
 
-                if duration == 0 or time.time() - starttime < duration:
-                    time.sleep(LVSSYNC_MIN_SLEEP)
-                else:
-                    break
         except KeyboardInterrupt:
             duration = time.time() - starttime
             pass
 
-        print >> fd, 'Received %s packets (%s total connections) during %.2f seconds' % (numpackets, numconnections, duration)
+        print 'Received %s packets (%s total connections) during %.2f seconds' % (numpackets, numconnections, duration)
 
-        self.__shutsocket()
+        self.shut_socket()
 
-    def __getipaddr(self, interface):
+    def print_conns_columns(self):
+        header = '%s%s%s%s%s%s%s%s' % (string.ljust('syncid', 7), string.center('pro', 4), string.center('expire', 7), \
+                                                string.center('state', 13), string.center('source', 22), \
+                                                string.center('virtual', 22), string.center('destination', 22), 'flags')
+        print header
+        print (len(header) + 20) * '='
+
+    def get_ipaddr(self, interface):
         '''
         Return the associated ip address from interface
 
@@ -609,7 +901,7 @@ class IPVSSync(object):
             [20:24])
         s.close()
 
-    def __initsocket(self, blocking=True):
+    def init_socket(self):
         '''
         Initialize the multicast socket
         '''
@@ -617,10 +909,9 @@ class IPVSSync(object):
         if self.interface == None:
             self.interfaceaddress = '0.0.0.0'
         else:
-            self.interfaceaddress = self.__getipaddr(self.interface)
+            self.interfaceaddress = self.get_ipaddr(self.interface)
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.socketisblocking = blocking
 
         # Set options
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -631,17 +922,13 @@ class IPVSSync(object):
         mreq = struct.pack('4s4s', socket.inet_aton(MCAST_GRP), socket.inet_aton(self.interfaceaddress))
         self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        if not blocking:
-            self.socket.setblocking(0)
-
-    def __shutsocket(self):
+    def shut_socket(self):
         '''
         '''
         self.socket.close()
         self.socket = None
-        self.socketisblocking = None
 
-    def __decode_conns(self, rawconns):
+    def decode_conns(self, rawconns):
         '''
         Decode the binary encoded connection list, and return a list
         of dict
@@ -651,35 +938,15 @@ class IPVSSync(object):
             if len(rawconns) <= 0:
                 break
             else:
-                conn_type, protocol, ver_size, flags, state, cport, \
-                vport, dport, fwmark, timeout, caddr, vaddr, daddr = struct.unpack('BBHIHHHHIIIII', rawconns[:IP_VS_CONN_CONNLEN])
-
-                conn_size = socket.ntohs(ver_size) & 0b0000111111111111
-                conn_ver = socket.ntohs(ver_size) >> 12
-
-                this_conn = {}
-                this_conn['type'] = conn_type
-                this_conn['protocol'] = protocol
-                this_conn['version'] = conn_ver
-                this_conn['size'] = conn_size
-                this_conn['flags'] = self.__decode_flags(socket.ntohl(flags))
-                this_conn['state'] = IP_VS_TCP_S_CONNECTION_STATES[socket.ntohs(state)]
-                this_conn['cport'] = socket.ntohs(cport)
-                this_conn['vport'] = socket.ntohs(vport)
-                this_conn['dport'] = socket.ntohs(dport)
-                this_conn['timeout'] = int(socket.ntohl(timeout))
-                this_conn['caddr'] = self.__unsigned_int_to_ip(socket.ntohl(caddr))
-                this_conn['vaddr'] = self.__unsigned_int_to_ip(socket.ntohl(vaddr))
-                this_conn['daddr'] = self.__unsigned_int_to_ip(socket.ntohl(daddr))
-
-                conns.append(this_conn)
+                this_connection = SyncConnection(self.logger, self.name_resolution, socket_buffer=rawconns[:IP_VS_CONN_CONNLEN])
+                conns.append(this_connection)
 
                 # Shift the buffer
-                rawconns = rawconns[conn_size:]
+                rawconns = rawconns[this_connection.size:]
 
         return conns
 
-    def __encode_connlist(self, connlist):
+    def encode_connlist(self, connlist):
         '''
         '''
         buffer = ''
@@ -694,146 +961,49 @@ class IPVSSync(object):
             ver_size = (socket.htons(conn_ver) << 12) | socket.htons(conn_size)
 
             # Conn data
-            flags = socket.htonl(IP_VS_F_FWD_METHOD.index(c['director_type']) | self.__encode_flags([IP_VS_CONN_F_NOOUTPUT['flag']]))
+            flags = socket.htonl(IP_VS_F_FWD_METHOD.index(c['director_type']) | self.encode_flags([IP_VS_CONN_F_NOOUTPUT['flag']]))
             state = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
             cport = socket.htons(c['cport'])
             vport = socket.htons(c['vport'])
             dport = socket.htons(c['dport'])
             fwmark = 0
             timeout = socket.htonl(c['timeout'])
-            caddr = socket.htonl(self.__ip_to_unsigned_int(c['caddr']))
-            vaddr = socket.htonl(self.__ip_to_unsigned_int(c['vaddr']))
-            daddr = socket.htonl(self.__ip_to_unsigned_int(c['daddr']))
+            caddr = socket.htonl(self.ip_to_unsigned_int(c['caddr']))
+            vaddr = socket.htonl(self.ip_to_unsigned_int(c['vaddr']))
+            daddr = socket.htonl(self.ip_to_unsigned_int(c['daddr']))
 
             buffer += struct.pack('BBHIHHHHIIIII', conn_type, protocol, ver_size, flags, state, cport, vport, dport, fwmark, timeout, caddr, vaddr, daddr)
 
         return buffer
 
-    def __decode_flags(self, rawflags):
-        '''
-        '''
-        flags = []
-
-        flags += [ IP_VS_F_FWD_METHOD[rawflags & 0x0007] ]
-
-        for f in IP_VS_F_BOOL:
-            if rawflags & f['flag']:
-                flags.append(f['flagname'])
-
-        return flags
-
-    def __encode_flags(self, flagslist):
-        '''
-        '''
-        rawflags = 0x0000
-
-        for f in flagslist:
-            rawflags = rawflags | f
-
-        return rawflags
-
-    def __unsigned_int_to_ip(self, unsigned_int):
-        '''
-        Return dotted quad ip str
-        '''
-        a = (unsigned_int & 0xff000000) >> 24
-        b = (unsigned_int & 0x00ff0000) >> 16
-        c = (unsigned_int & 0x0000ff00) >> 8
-        d = unsigned_int & 0x000000ff
-        return '%s.%s.%s.%s' % (a, b, c, d)
-
-    def __ip_to_unsigned_int(self, dotted_quad_ip):
-        '''
-        Return unsigned int from dotted quad
-        '''
-        unsigned_int = 0x00000000
-        for quad_id in range(4):
-            quad = dotted_quad_ip.split('.')[quad_id]
-
-            unsigned_int += int(quad) << ((8 * (3 - quad_id)))
-
-        return unsigned_int
-
-    def __print_conns(self, fd, header, conns, printdate=False, nameresolution=False):
+    def print_conns(self, fd, header, conns, printdate=False, nameresolution=False):
         '''
         '''
         stringlist = []
 
         for c in conns:
-            # Get protocol name
-            if c['protocol'] == socket.SOL_TCP:
-                protocol_str = 'TCP'
-            elif c['protocol'] == socket.SOL_UDP:
-                protocol_str = 'UDP'
-            else:
-                protocol_str = str(c['protocol'])
+            print c
 
-            # Get expiration format
-            expire = '%3d:%2s' % (c['timeout'] / 60, str(c['timeout'] % 60).zfill(2))
-
-            # Get s/v/d client:protocol pair
-            caddr, vaddr , daddr = (c['caddr'] , c['vaddr'] , c['daddr'])
-            addrspacer = ''
-
-            if nameresolution:
-                addrspacer = ' '
-                try:
-                    caddr = socket.gethostbyaddr(caddr)[0]
-
-                    if not LVSSYNC_FQDN_NR:
-                        caddr = caddr.split('.')[0]
-                except:
-                    pass
-
-                try:
-                    vaddr = socket.gethostbyaddr(vaddr)[0]
-
-                    if not LVSSYNC_FQDN_NR:
-                        vaddr = vaddr.split('.')[0]
-                except:
-                    pass
-
-                try:
-                    daddr = socket.gethostbyaddr(daddr)[0]
-
-                    if not LVSSYNC_FQDN_NR:
-                        daddr = daddr.split('.')[0]
-                except:
-                    pass
-
-
-            source = '%s:%s' % (caddr, c['cport']) + addrspacer
-            virtual = '%s:%s' % (vaddr, c['vport']) + addrspacer
-            destination = '%s:%s' % (daddr, c['dport']) + addrspacer
-
-            strformat = '%s%s%s%s%s%s%s%s' % (string.ljust(str(header['syncid']), 7), string.center(protocol_str, 4), string.center(expire, 7), \
-                                                    string.center(c['state'], 13), string.center(source, 22), \
-                                                    string.center(virtual, 22), string.center(destination, 22), ' '.join(c['flags']))
-
-            stringlist += [strformat]
-
-        self.__print_debug(fd, stringlist, printdate)
-
-    def __print_conns_col(self, fd, printdate=False):
-        '''
-        '''
-        strformat = '%s%s%s%s%s%s%s%s' % (string.ljust('syncid', 7), string.center('pro', 4), string.center('expire', 7), \
-                                                string.center('state', 13), string.center('source', 22), \
-                                                string.center('virtual', 22), string.center('destination', 22), 'flags')
-        sep = (len(strformat) + 20) * '='
-
-        self.__print_debug(fd, [strformat, sep], printdate)
-
-    def __print_debug(self, fd, stringlist, printdate=False):
-        '''
-        '''
-        if printdate:
-            datestring = time.strftime(LVSSYNC_DEBUG_TIME_FMT) + '   '
-        else:
-            datestring = ''
-
-        for s in stringlist:
-            print >> fd, '%s%s' % (datestring, s)
+#     def print_conns_col(self, fd, printdate=False):
+#         '''
+#         '''
+#         strformat = '%s%s%s%s%s%s%s%s' % (string.ljust('syncid', 7), string.center('pro', 4), string.center('expire', 7), \
+#                                                 string.center('state', 13), string.center('source', 22), \
+#                                                 string.center('virtual', 22), string.center('destination', 22), 'flags')
+#         sep = (len(strformat) + 20) * '='
+#
+#         self.print_debug(fd, [strformat, sep], printdate)
+#
+#     def print_debug(self, fd, stringlist, printdate=False):
+#         '''
+#         '''
+#         if printdate:
+#             datestring = time.strftime(LVSSYNC_DEBUG_TIME_FMT) + '   '
+#         else:
+#             datestring = ''
+#
+#         for s in stringlist:
+#             print >> fd, '%s%s' % (datestring, s)
 
 # if __name__ == '__main__':
 #     import socket
@@ -874,10 +1044,10 @@ class IPVSSync(object):
 #         connspersec = 1
 #         before = time.time()
 #
-#         duration = sync.getsendconnlistduration(conn_list,connspersec)
+#         duration = sync.get_send_conn_list_duration(conn_list,connspersec)
 #
 #         print 'Sending %s connections should take around %s sec at %s connections/sec' % (len(conn_list),duration,connspersec)
-#         sync.sendconnlist(conn_list, connspersec=connspersec)
+#         sync.send_conn_list(conn_list, connspersec=connspersec)
 #
 #         after = time.time()
 #         print '... Sending time was %3.2f sec' % (after - before)
