@@ -32,17 +32,28 @@ class LVS(sysadmintoolkit.plugin.Plugin):
     def __init__(self, logger, config):
         super(LVS, self).__init__('lvs', logger, config)
 
+        self.clustering_plugin = None
+
         ret, out = sysadmintoolkit.utils.get_status_output('which ipvsadm', self.logger)
         if ret is not 0:
             raise sysadmintoolkit.exception.PluginError('Critical error in lvs plugin: ipvsadm command could not be found', errno=201)
 
-        self.name_resolution = config['name-resolution'].lower() in ['yes']
+        self.name_resolution = self.config['name-resolution'].lower() in ['yes']
+
+        self.cluster_nodeset_name = 'default'
+
+        self.ipvssync_cps = 250
+        if 'lvs-sync-cps' in self.config:
+            try:
+                self.ipvssync_cps = int(self.config['lvs-sync-cps'])
+            except:
+                self.logger.error('lvs-sync-cps must be an integer!')
 
         ret, out = sysadmintoolkit.utils.get_status_output('ipvsadm -L --daemon', self.logger)
         if out is not '':
-            self.syncid = out.splitlines()[0].split('syncid=')[-1].split(')')[0]
+            self.syncid = int(out.splitlines()[0].split('syncid=')[-1].split(')')[0])
             self.sync_int = out.splitlines()[0].split('mcast=')[-1].split(',')[0]
-            self.sync_version = sysadmintoolkit.utils.get_status_output('cat /proc/sys/net/ipv4/vs/sync_version', self.logger)[1].strip()
+            self.sync_version = int(sysadmintoolkit.utils.get_status_output('cat /proc/sys/net/ipv4/vs/sync_version', self.logger)[1].strip())
             self.ipvssync = IPVSSync(self.syncid, self.logger, self.name_resolution, interface=self.sync_int, sync_protocol_version=self.sync_version)
         else:
             self.syncid = None
@@ -72,7 +83,11 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         super(LVS, self).update_plugin_set(plugin_set)
 
         if 'clustering' in self.plugin_set.get_plugins():
-            self.add_command(sysadmintoolkit.command.ExecCommand('show cluster loadbalancer lvs out-of-sync-connections', self, self.display_connections_cmd))
+            self.clustering_plugin = self.plugin_set.get_plugins()['clustering']
+
+            self.add_command(sysadmintoolkit.command.ExecCommand('show cluster loadbalancer lvs connections out-of-sync', self, self.display_oos_connections_cmd))
+            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections test', self, self.test_lvssync))
+            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections', self, self.lvssync_synchronize))
 
     def refresh_vs_and_rs_cache(self):
         self.logger.debug('Refreshing virtual/real server cache')
@@ -320,6 +335,72 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             print '%s     Closing: %s' % (' ' * len(service_str), len(closed_connections))
             print
 
+    def get_cluster_connections(self):
+        return self.clustering_plugin.run_cluster_command('ipvsadm -L -n -c | grep -v ^IPVS | grep -v ^pro', \
+                                                          self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+
+    def get_oos_connections(self):
+        buffer_nodes_list = self.get_cluster_connections()
+
+        nodemap = {}
+        all_connections = {}
+
+        for node in self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name):
+            # Nodes that returns 0 connections must show up regardless
+            nodemap[node] = {'raw_connections_list': '', 'connections_map': {}}
+
+        for (buffer, nodes) in buffer_nodes_list:
+            for node in nodes:
+                connections_map = {}
+                for connection in buffer.splitlines():
+                    connection_without_timeout = ' '.join([connection.split()[0]] + connection.split()[2:])
+                    min, sec = connection.split()[1].split(':')
+                    connections_map[connection_without_timeout] = (int(min) * 60) + int(sec)
+
+                    if connection_without_timeout not in all_connections:
+                        all_connections[connection_without_timeout] = connections_map[connection_without_timeout]
+                    else:
+                        all_connections[connection_without_timeout] = max(all_connections[connection_without_timeout], \
+                                                                          connections_map[connection_without_timeout])
+
+                nodemap[node] = {'raw_connections_list': buffer, 'connections_map': connections_map}
+
+        nodes = nodemap.keys()
+        nodes.sort()
+        for node in nodes:
+            missing_connections = []
+
+            if len(nodemap[node]['connections_map']) is not len(all_connections):
+                self.logger.warning('Node %s has %s out-of sync connections' % (node, len(all_connections) - len(nodemap[node]['connections_map'])))
+
+                for connection in all_connections:
+                    if connection not in nodemap[node]['connections_map']:
+                        missing_connections.append(connection)
+
+            nodemap[node]['missing_connections_map'] = missing_connections
+
+        return nodemap, all_connections
+
+    def display_oos_connections(self, nodemap, all_connections):
+        oos_connections_result = 0
+
+        print 'Out-of-sync connections:'
+
+        nodes = nodemap.keys()
+        nodes.sort()
+        for node in nodes:
+            if len(nodemap[node]['missing_connections_map']):
+                oos_connections_result = 1
+
+            print '  %s %s' % (('%s:' % node).ljust(15), str(len(nodemap[node]['missing_connections_map'])).rjust(5))
+
+            for connection in nodemap[node]['missing_connections_map']:
+                print '    %s' % connection
+
+            print
+
+        return oos_connections_result
+
     # Dynamic keywords
 
     def get_virtual_servers(self, dyn_keyword=None):
@@ -364,6 +445,103 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         '''
         print sysadmintoolkit.utils.get_status_output('ipvsadm -L -n -c', self.logger)[1]
 
+    def display_oos_connections_cmd(self, line, mode):
+        '''
+        Displays out of sync connections between lvs in the cluster
+        '''
+        self.logger.debug('Displaying out-of-sync connections')
+
+        nodemap, all_connections = self.get_oos_connections()
+
+        return self.display_oos_connections(nodemap, all_connections)
+
+    def test_lvssync(self, line, mode):
+        '''
+        Send dummy client connections to verify sync functionality
+        '''
+        self.logger.debug('Testing LVS Sync functionality')
+
+        dummy_connection1 = SyncConnection(self.logger, name_resolution=self.name_resolution)
+        dummy_connection1.set_caddr_cport('10.11.11.11', 11111)
+        dummy_connection1.set_vaddr_vport('10.22.22.22', 22222)
+        dummy_connection1.set_daddr_dport('10.33.33.33', 33333)
+        dummy_connection1.set_timeout(30)
+
+        print 'Sending test client connection: %s' % dummy_connection1
+        print
+
+        self.ipvssync.send_conn_list([dummy_connection1], self.ipvssync_cps)
+
+        print 'Validating all nodes received the connection... '
+        print
+
+        buffer_nodes_list = self.get_cluster_connections()
+
+        nodemap = {}
+
+        for node in self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name):
+            # Nodes that returns 0 connections must show up regardless
+            nodemap[node] = sysadmintoolkit.utils.get_red_text('Failed')
+
+        for (buffer, nodes) in buffer_nodes_list:
+            for node in nodes:
+                for connection in buffer.splitlines():
+                    if 'ESTABLISHED 10.11.11.11:11111  10.22.22.22:22222  10.33.33.33:33333' in connection:
+                        nodemap[node] = sysadmintoolkit.utils.get_green_text('Success')
+                        break
+
+        nodemap_keys = nodemap.keys()
+        nodemap_keys.sort()
+
+        print 'Test results:'
+        print
+
+        for node in nodemap_keys:
+            print '  %s %s' % (('%s:' % node).ljust(15), nodemap[node])
+            print
+
+    def lvssync_synchronize(self, line, mode):
+        '''
+        Synchronizes out-of-sync connections across the cluster
+        '''
+        self.logger.info('Synchronizing LVS connections across the cluster')
+
+        nodemap, all_connections = self.get_oos_connections()
+
+        connections_to_sync_map = {}
+
+        for node in nodemap:
+            for missing_connection in nodemap[node]['missing_connections_map']:
+                if missing_connection not in connections_to_sync_map:
+                    sync_connection = SyncConnection(self.logger, self.name_resolution)
+
+                    state, caddr_port, vaddr_port, daddr_port = missing_connection.split()[1:]
+
+                    sync_connection.set_caddr_cport(caddr_port.split(':')[0], int(caddr_port.split(':')[1]))
+                    sync_connection.set_vaddr_vport(vaddr_port.split(':')[0], int(vaddr_port.split(':')[1]))
+                    sync_connection.set_daddr_dport(daddr_port.split(':')[0], int(daddr_port.split(':')[1]))
+                    sync_connection.set_timeout(all_connections[missing_connection])
+                    
+                    connections_to_sync_map[missing_connection] = sync_connection
+
+        connlist = [conn for k, conn in connections_to_sync_map.items()]
+
+        self.logger.debug('Sending following connections for synchronization:')
+        for connection_obj in connlist:
+            self.logger.debug('  %s' % connection_obj)
+
+        print 'Sending %s connections from interface %s to syncid %s' % (len(connlist), self.sync_int, self.syncid)
+        print
+        print 'Full synchronization should take %s seconds at a rate of %s connections per second' % \
+                (self.ipvssync.get_send_conn_list_duration(connlist, self.ipvssync_cps), self.ipvssync_cps)
+        print
+
+        self.ipvssync.send_conn_list(connlist, self.ipvssync_cps)
+
+        print 'Synchronization ended, validating...'
+        print
+
+        return self.display_oos_connections_cmd(None, None)
 
     def display_virtual_servers_mapping(self, line, mode):
         '''
@@ -434,9 +612,10 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         if self.syncid:
             print '  Connection synchronization information:'
-            print '       sync version: %s' % self.sync_version
-            print '             syncid: %s' % self.syncid
-            print '    mcast interface: %s' % self.sync_int
+            print '        sync version: %s' % self.sync_version
+            print '              syncid: %s' % self.syncid
+            print '     mcast interface: %s' % self.sync_int
+            print '    max cps for sync: %s connections/second' % self.ipvssync_cps
         else:
             print '  No connection synchronization support'
         print
@@ -539,16 +718,14 @@ SIOCGIFADDR = 0x8915
 
 class SyncConnectionHeader(object):
     def __init__(self, logger, socket_buffer=None):
-        self.initialized = False
-
         self.logger = logger
 
         self.size = None
-        self.reserved = None
-        self.syncid = None
-        self.nr_conns = None
-        self.version = None
-        self.spare = None
+        self.reserved = 0
+        self.syncid = 0
+        self.nr_conns = 0
+        self.version = 1
+        self.spare = 0
 
         if socket_buffer:
             self.decode_from_socket(socket_buffer)
@@ -567,21 +744,33 @@ class SyncConnectionHeader(object):
         self.version = version
         self.spare = spare
 
-        self.initialized = True
+    def encode_for_socket(self):
+        return struct.pack('BBHBbH', self.reserved, self.syncid, socket.htons(self.size), self.nr_conns, self.version, self.spare)
+
+    def set_syncid(self, syncid):
+        self.syncid = syncid
+
+    def set_nr_conns(self, nr_conns):
+        self.nr_conns = nr_conns
+
+    def set_version(self, version):
+        self.version = version
+
+    def set_size(self, size):
+        self.size = size
+
 
 class SyncConnection(object):
-    def __init__(self, logger, name_resolution, ipvsadm_conn_str=None, socket_buffer=None):
-        self.initialized = False
-
+    def __init__(self, logger, name_resolution, socket_buffer=None):
         self.logger = logger
         self.name_resolution = name_resolution
 
-        self.type = None
-        self.protocol = None
-        self.version = None
+        self.type = 0
+        self.protocol = socket.SOL_TCP
+        self.version = 0
         self.size = None
-        self.flags = None
-        self.state = None
+        self.flags = IP_VS_CONN_F_NOOUTPUT['flag']
+        self.state = IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED')
         self.cport = None
         self.vport = None
         self.dport = None
@@ -589,6 +778,7 @@ class SyncConnection(object):
         self.caddr = None
         self.vaddr = None
         self.daddr = None
+        self.fwmark = 0
 
         if socket_buffer:
             self.decode_from_socket(socket_buffer)
@@ -643,8 +833,8 @@ class SyncConnection(object):
         destination = '%s:%s' % (daddr, self.dport) + addrspacer
 
         return '%s%s%s%s%s%s%s' % (string.center(protocol_str, 4), string.center(expire, 7), \
-                                                string.center(self.state, 13), string.center(source, 22), \
-                                                string.center(virtual, 22), string.center(destination, 22), ' '.join(self.flags))
+                                                string.center(IP_VS_TCP_S_CONNECTION_STATES[self.state], 13), string.center(source, 22), \
+                                                string.center(virtual, 22), string.center(destination, 22), ' '.join(self.decode_flags(self.flags)))
 
     def decode_from_socket(self, socket_buffer):
         conn_type, protocol, ver_size, flags, state, cport, \
@@ -654,17 +844,33 @@ class SyncConnection(object):
         self.protocol = protocol
         self.version = socket.ntohs(ver_size) >> 12
         self.size = socket.ntohs(ver_size) & 0b0000111111111111
-        self.flags = self.decode_flags(socket.ntohl(flags))
-        self.state = IP_VS_TCP_S_CONNECTION_STATES[socket.ntohs(state)]
+        self.flags = socket.ntohl(flags)
+        self.state = socket.ntohs(state)
         self.cport = socket.ntohs(cport)
         self.vport = socket.ntohs(vport)
         self.dport = socket.ntohs(dport)
+        self.fwmark = int(socket.ntohl(fwmark))
         self.timeout = int(socket.ntohl(timeout))
         self.caddr = self.unsigned_int_to_ip(socket.ntohl(caddr))
         self.vaddr = self.unsigned_int_to_ip(socket.ntohl(vaddr))
         self.daddr = self.unsigned_int_to_ip(socket.ntohl(daddr))
 
-        self.initialized = True
+    def encode_for_socket(self):
+        # Conn header
+        conn_size = struct.calcsize('BBHIHHHHIIIII')
+        ver_size = (socket.htons(self.version) << 12) | socket.htons(conn_size)
+
+        # Conn data
+        state = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
+        caddr = socket.htonl(self.ip_to_unsigned_int(self.caddr))
+        vaddr = socket.htonl(self.ip_to_unsigned_int(self.vaddr))
+        daddr = socket.htonl(self.ip_to_unsigned_int(self.daddr))
+
+        return struct.pack('BBHIHHHHIIIII', self.type, self.protocol, ver_size, socket.htonl(self.flags), \
+                              socket.htons(self.state), socket.htons(self.cport), socket.htons(self.vport), \
+                              socket.htons(self.dport), socket.htonl(self.fwmark), socket.htonl(self.timeout), \
+                              caddr, vaddr, daddr)
+
 
     def unsigned_int_to_ip(self, unsigned_int):
         '''
@@ -699,13 +905,63 @@ class SyncConnection(object):
 
         return flags
 
-    def encode_flags(self, flagslist):
-        rawflags = 0x0000
+    def set_protocol(self, protocol):
+        '''
+        socket.SOL_TCP or socket.SOL_UDP
 
-        for f in flagslist:
-            rawflags = rawflags | f
+        Normally this would be TCP
+        '''
+        self.protocol = protocol
 
-        return rawflags
+    def set_state(self, state):
+        '''
+        This is the index of IP_VS_TCP_S_CONNECTION_STATES
+
+        ex:
+            set_state(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
+        '''
+        self.state = state
+
+    def set_flags(self, flags):
+        '''
+        Bitwise or of IP_VS_F flags. This is here the director type is set, and you can launch debug mode to
+        see which other flags are useful.
+
+        IP_VS_F_FWD_METHOD is a list of forwarding modes, the index is the flag
+
+        Other flags are defined in IP_VS_CONN_F*['flag']
+
+        Ex:
+            set_flags(IP_VS_F_FWD_METHOD.index('DROUTE') | IP_VS_CONN_F_NOOUTPUT['flag'])
+        '''
+        self.flags = flags
+
+    def set_caddr_cport(self, caddr, cport):
+        '''
+        addr is an ipv4 address, in the format "10.11.12.13"
+        cport in an int representing the l4 port
+        '''
+        self.caddr = caddr
+        self.cport = cport
+
+    def set_vaddr_vport(self, vaddr, vport):
+        '''
+        addr is an ipv4 address, in the format "10.11.12.13"
+        cport in an int representing the l4 port
+        '''
+        self.vaddr = vaddr
+        self.vport = vport
+
+    def set_daddr_dport(self, daddr, dport):
+        '''
+        addr is an ipv4 address, in the format "10.11.12.13"
+        cport in an int representing the l4 port
+        '''
+        self.daddr = daddr
+        self.dport = dport
+
+    def set_timeout(self, timeout):
+        self.timeout = timeout
 
 
 class IPVSSync(object):
@@ -767,6 +1023,7 @@ class IPVSSync(object):
     def get_send_conn_list_duration(self, connlist, connspersec=250):
         '''
         Returns the number of seconds if should take to send this list of connections
+
         '''
         maxconnpermessage = int(math.floor((self.maxmcastmessage - IP_VS_CONN_HDRLEN) / IP_VS_CONN_CONNLEN))
         maxconnpermessage = min(maxconnpermessage, connspersec)
@@ -778,20 +1035,12 @@ class IPVSSync(object):
         Sends the connlist of connections to the lvs mcast group,
         to update all lvs on the network
 
-        connlist    list    [conn, conn, ... conn]
+        connlist    list    [SyncConnection]
         connspersec int     Upper limit of connections per second to transmit
 
-        conn        dict    {   'protocol'      : int of socket.SOL_TCP | socket.SOL_UDP | other ... ,
-                                'director_type' : str in IP_VS_F_FWD_METHOD
-                                'timeout'       : int in seconds
-                                'cport'         : int client tcp port
-                                'vport'         : int virtual tcp port
-                                'dport'         : int destination tcp port
-                                'caddr'         : str client ipv4 addr in dotted quad
-                                'vaddr'         : str virtual ipv4 addr in dotted quad
-                                'daddr'         : str destination ipv4 addr in dotted quad
-                            }
         '''
+        self.logger.info('Sending %s IPVS sync connections' % len(connlist))
+
         if self.socket == None:
             self.init_socket()
 
@@ -816,22 +1065,19 @@ class IPVSSync(object):
                 # Generate the buffer data for the connections to send with this message
                 buffconns = self.encode_connlist(connlist[:nr_conns])
 
-                reserved = 0
-                syncid = self.syncid
-                size = socket.htons(IP_VS_CONN_HDRLEN + len(buffconns))
-                version = 1
-                spare = 0
+                header = SyncConnectionHeader(self.logger)
+                header.set_nr_conns(nr_conns)
+                header.set_syncid(self.syncid)
+                header.set_version(self.sync_protocol_version)
+                header.set_size(IP_VS_CONN_HDRLEN + len(buffconns))
 
-                buffhdr = struct.pack('BBHBbH', reserved, syncid, size, nr_conns, version, spare)
-
-                self.socket.sendto(buffhdr + buffconns, (MCAST_GRP, MCAST_PORT))
+                self.socket.sendto(header.encode_for_socket() + buffconns, (MCAST_GRP, MCAST_PORT))
 
                 nr_sent_this_second += nr_conns
                 last_sent_time = time.time()
                 connlist = connlist[nr_conns:]
 
         self.shut_socket()
-
 
     def debug(self):
         '''
@@ -953,26 +1199,28 @@ class IPVSSync(object):
 
         for c in connlist:
             # Conn header
-            conn_type = 0
-            protocol = c['protocol']
-            conn_ver = 0
-            conn_size = struct.calcsize('BBHIHHHHIIIII')
+#             conn_type = 0
+#             protocol = c['protocol']
+#             conn_ver = 0
+#             conn_size = struct.calcsize('BBHIHHHHIIIII')
+#
+#             ver_size = (socket.htons(conn_ver) << 12) | socket.htons(conn_size)
+#
+#             # Conn data
+#             flags = socket.htonl(IP_VS_F_FWD_METHOD.index(c['director_type']) | self.encode_flags([IP_VS_CONN_F_NOOUTPUT['flag']]))
+#             state = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
+#             cport = socket.htons(c['cport'])
+#             vport = socket.htons(c['vport'])
+#             dport = socket.htons(c['dport'])
+#             fwmark = 0
+#             timeout = socket.htonl(c['timeout'])
+#             caddr = socket.htonl(self.ip_to_unsigned_int(c['caddr']))
+#             vaddr = socket.htonl(self.ip_to_unsigned_int(c['vaddr']))
+#             daddr = socket.htonl(self.ip_to_unsigned_int(c['daddr']))
 
-            ver_size = (socket.htons(conn_ver) << 12) | socket.htons(conn_size)
+#            buffer += struct.pack('BBHIHHHHIIIII', conn_type, protocol, ver_size, flags, state, cport, vport, dport, fwmark, timeout, caddr, vaddr, daddr)
 
-            # Conn data
-            flags = socket.htonl(IP_VS_F_FWD_METHOD.index(c['director_type']) | self.encode_flags([IP_VS_CONN_F_NOOUTPUT['flag']]))
-            state = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
-            cport = socket.htons(c['cport'])
-            vport = socket.htons(c['vport'])
-            dport = socket.htons(c['dport'])
-            fwmark = 0
-            timeout = socket.htonl(c['timeout'])
-            caddr = socket.htonl(self.ip_to_unsigned_int(c['caddr']))
-            vaddr = socket.htonl(self.ip_to_unsigned_int(c['vaddr']))
-            daddr = socket.htonl(self.ip_to_unsigned_int(c['daddr']))
-
-            buffer += struct.pack('BBHIHHHHIIIII', conn_type, protocol, ver_size, flags, state, cport, vport, dport, fwmark, timeout, caddr, vaddr, daddr)
+            buffer += c.encode_for_socket()
 
         return buffer
 
@@ -984,41 +1232,6 @@ class IPVSSync(object):
         for c in conns:
             print c
 
-#     def print_conns_col(self, fd, printdate=False):
-#         '''
-#         '''
-#         strformat = '%s%s%s%s%s%s%s%s' % (string.ljust('syncid', 7), string.center('pro', 4), string.center('expire', 7), \
-#                                                 string.center('state', 13), string.center('source', 22), \
-#                                                 string.center('virtual', 22), string.center('destination', 22), 'flags')
-#         sep = (len(strformat) + 20) * '='
-#
-#         self.print_debug(fd, [strformat, sep], printdate)
-#
-#     def print_debug(self, fd, stringlist, printdate=False):
-#         '''
-#         '''
-#         if printdate:
-#             datestring = time.strftime(LVSSYNC_DEBUG_TIME_FMT) + '   '
-#         else:
-#             datestring = ''
-#
-#         for s in stringlist:
-#             print >> fd, '%s%s' % (datestring, s)
-
-# if __name__ == '__main__':
-#     import socket
-#     import lvssync
-#     import os
-#
-#     if 'LVSSYNCMODE' in os.environ:
-#         mode = os.environ['LVSSYNCMODE']
-#     else:
-#         mode = 'debug'
-#
-#     if 'LVSSYNCNR' in os.environ:
-#         nameresolution = os.environ['LVSSYNCNR']
-#     else:
-#         nameresolution = False
 #
 #     if 'LVSSYNCINT' in os.environ:
 #         sync = lvssync.ipvssync(10,os.environ['LVSSYNCINT'])
