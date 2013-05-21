@@ -534,7 +534,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
                     sync_connection.set_vaddr_vport(vaddr_port.split(':')[0], int(vaddr_port.split(':')[1]))
                     sync_connection.set_daddr_dport(daddr_port.split(':')[0], int(daddr_port.split(':')[1]))
                     sync_connection.set_timeout(all_connections[missing_connection])
-                    
+
                     connections_to_sync_map[missing_connection] = sync_connection
 
         connlist = [conn for k, conn in connections_to_sync_map.items()]
@@ -1213,28 +1213,6 @@ class IPVSSync(object):
         buffer = ''
 
         for c in connlist:
-            # Conn header
-#             conn_type = 0
-#             protocol = c['protocol']
-#             conn_ver = 0
-#             conn_size = struct.calcsize('BBHIHHHHIIIII')
-#
-#             ver_size = (socket.htons(conn_ver) << 12) | socket.htons(conn_size)
-#
-#             # Conn data
-#             flags = socket.htonl(IP_VS_F_FWD_METHOD.index(c['director_type']) | self.encode_flags([IP_VS_CONN_F_NOOUTPUT['flag']]))
-#             state = socket.htons(IP_VS_TCP_S_CONNECTION_STATES.index('ESTABLISHED'))
-#             cport = socket.htons(c['cport'])
-#             vport = socket.htons(c['vport'])
-#             dport = socket.htons(c['dport'])
-#             fwmark = 0
-#             timeout = socket.htonl(c['timeout'])
-#             caddr = socket.htonl(self.ip_to_unsigned_int(c['caddr']))
-#             vaddr = socket.htonl(self.ip_to_unsigned_int(c['vaddr']))
-#             daddr = socket.htonl(self.ip_to_unsigned_int(c['daddr']))
-
-#            buffer += struct.pack('BBHIHHHHIIIII', conn_type, protocol, ver_size, flags, state, cport, vport, dport, fwmark, timeout, caddr, vaddr, daddr)
-
             buffer += c.encode_for_socket()
 
         return buffer
@@ -1247,39 +1225,3 @@ class IPVSSync(object):
         for c in conns:
             print c
 
-#
-#     if 'LVSSYNCINT' in os.environ:
-#         sync = lvssync.ipvssync(10,os.environ['LVSSYNCINT'])
-#     else:
-#         sync = lvssync.ipvssync(10)
-#
-#     if mode == 'debug':
-#         sync.debug(0,nameresolution=nameresolution,printdate=True)
-#     elif mode == 'testsend':
-#         connection1 = {  'protocol' : socket.SOL_TCP, 'director_type' : 'DROUTE', 'timeout' : 60, \
-#                         'cport'    : 11111, 'vport' : 22222, 'dport' : 33333, \
-#                         'caddr'    : '10.1.1.1', 'vaddr' : '10.2.2.2', 'daddr' : '10.3.3.3' }
-#
-#         connection2 = {  'protocol' : socket.SOL_TCP, 'director_type' : 'DROUTE', 'timeout' : 60, \
-#                         'cport'    : 11111, 'vport' : 22222, 'dport' : 33333, \
-#                         'caddr'    : '10.10.1.1', 'vaddr' : '10.20.2.2', 'daddr' : '10.30.3.3' }
-#
-#         connection3 = {  'protocol' : socket.SOL_TCP, 'director_type' : 'DROUTE', 'timeout' : 60, \
-#                         'cport'    : 11111, 'vport' : 22222, 'dport' : 33333, \
-#                         'caddr'    : '10.10.10.1', 'vaddr' : '10.20.20.2', 'daddr' : '10.30.30.3' }
-#
-#         conn_list = [connection1,connection2,connection3]
-#         connspersec = 1
-#         before = time.time()
-#
-#         duration = sync.get_send_conn_list_duration(conn_list,connspersec)
-#
-#         print 'Sending %s connections should take around %s sec at %s connections/sec' % (len(conn_list),duration,connspersec)
-#         sync.send_conn_list(conn_list, connspersec=connspersec)
-#
-#         after = time.time()
-#         print '... Sending time was %3.2f sec' % (after - before)
-#
-#     elif mode == 'help':
-#         help(lvssync)
-#
