@@ -403,7 +403,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     # Dynamic keywords
 
-    def get_virtual_servers(self, dyn_keyword=None):
+    def get_virtual_servers(self, user_input_obj=None):
         '''
         Returns the list of virtual servers
         '''
@@ -420,7 +420,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         return vsmap
 
-    def get_real_servers(self, dyn_keyword=None):
+    def get_real_servers(self, user_input_obj=None):
         '''
         Returns the list of real servers
         '''
@@ -439,13 +439,13 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     # Sysadmin-toolkit commands
 
-    def display_connections_cmd(self, line, mode):
+    def display_connections_cmd(self, user_input_obj):
         '''
         Displays connection table
         '''
         print sysadmintoolkit.utils.get_status_output('ipvsadm -L -n -c', self.logger)[1]
 
-    def display_oos_connections_cmd(self, line, mode):
+    def display_oos_connections_cmd(self, user_input_obj):
         '''
         Displays out of sync connections between lvs in the cluster
         '''
@@ -455,7 +455,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         return self.display_oos_connections(nodemap, all_connections)
 
-    def test_lvssync(self, line, mode):
+    def test_lvssync(self, user_input_obj):
         '''
         Send dummy client connections to verify sync functionality
         '''
@@ -500,7 +500,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             print '  %s %s' % (('%s:' % node).ljust(15), nodemap[node])
             print
 
-    def lvssync_synchronize(self, line, mode):
+    def lvssync_synchronize(self, user_input_obj):
         '''
         Synchronizes out-of-sync connections across the cluster
         '''
@@ -543,7 +543,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         return self.display_oos_connections_cmd(None, None)
 
-    def display_virtual_servers_mapping(self, line, mode):
+    def display_virtual_servers_mapping(self, user_input_obj):
         '''
         Displays virtual servers to real servers mapping
         '''
@@ -556,10 +556,11 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
             self.print_virtual_server_mapping(virtual_server)
 
-    def display_virtual_server_cmd(self, line, mode):
+    def display_virtual_server_cmd(self, user_input_obj):
         '''
         Displays Virtual Server information
         '''
+        line = user_input_obj.get_entered_command()
 
         if 'virtual-server' == line.split()[-1]:
             virtual_servers_keys = self.virtual_servers.keys()
@@ -576,10 +577,11 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             self.display_virtual_server(vs, connections)
             print
 
-    def display_real_server_cmd(self, line, mode):
+    def display_real_server_cmd(self, user_input_obj):
         '''
         Displays Real Server information
         '''
+        line = user_input_obj.get_entered_command()
 
         if 'real-server' == line.split()[-1]:
             real_servers_keys = self.real_servers.keys()
@@ -597,7 +599,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             print
 
 
-    def debug(self, line, mode):
+    def debug(self, user_input_obj):
         '''
         Displays LVS configuration and state
         '''
@@ -620,7 +622,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             print '  No connection synchronization support'
         print
 
-    def debug_lvs_sync(self, line, mode):
+    def debug_lvs_sync(self, user_input_obj):
         '''
         Dump all LVS Sync packets seen on the Sync Daemon interface
         '''
