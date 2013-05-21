@@ -50,7 +50,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
                 self.logger.error('lvs-sync-cps must be an integer!')
 
         ret, out = sysadmintoolkit.utils.get_status_output('ipvsadm -L --daemon', self.logger)
-        if out is not '':
+        if ret is 0:
             self.syncid = int(out.splitlines()[0].split('syncid=')[-1].split(')')[0])
             self.sync_int = out.splitlines()[0].split('mcast=')[-1].split(',')[0]
             self.sync_version = int(sysadmintoolkit.utils.get_status_output('cat /proc/sys/net/ipv4/vs/sync_version', self.logger)[1].strip())
@@ -63,21 +63,19 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         self.virtual_servers = {}
         self.real_servers = {}
 
-        self.refresh_vs_and_rs_cache()
+        self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs', self, self.debug), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_virtual_servers_mapping), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server', self, self.display_virtual_server_cmd), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server <virtual-server>', self, self.display_virtual_server_cmd), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server', self, self.display_real_server_cmd), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server <real-server>', self, self.display_real_server_cmd), modes=['root', 'config'])
+        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs connections', self, self.display_connections_cmd), modes=['root', 'config'])
 
-        self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs', self, self.debug))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs binding', self, self.display_virtual_servers_mapping))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server', self, self.display_virtual_server_cmd))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs virtual-server <virtual-server>', self, self.display_virtual_server_cmd))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server', self, self.display_real_server_cmd))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs real-server <real-server>', self, self.display_real_server_cmd))
-        self.add_command(sysadmintoolkit.command.ExecCommand('show loadbalancer lvs connections', self, self.display_connections_cmd))
-
-        self.add_dynamic_keyword_fn('<virtual-server>', self.get_virtual_servers)
-        self.add_dynamic_keyword_fn('<real-server>', self.get_real_servers)
+        self.add_dynamic_keyword_fn('<virtual-server>', self.get_virtual_servers, modes=['root', 'config'])
+        self.add_dynamic_keyword_fn('<real-server>', self.get_real_servers, modes=['root', 'config'])
 
         if self.syncid:
-            self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs lvssync', self, self.debug_lvs_sync))
+            self.add_command(sysadmintoolkit.command.ExecCommand('debug lvs lvssync', self, self.debug_lvs_sync), modes=['root', 'config'])
 
     def update_plugin_set(self, plugin_set):
         super(LVS, self).update_plugin_set(plugin_set)
@@ -85,9 +83,24 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         if 'clustering' in self.plugin_set.get_plugins():
             self.clustering_plugin = self.plugin_set.get_plugins()['clustering']
 
-            self.add_command(sysadmintoolkit.command.ExecCommand('show cluster loadbalancer lvs connections out-of-sync', self, self.display_oos_connections_cmd))
-            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections test', self, self.test_lvssync))
-            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections', self, self.lvssync_synchronize))
+            self.add_command(sysadmintoolkit.command.ExecCommand('show cluster loadbalancer lvs connections out-of-sync', self, self.display_oos_connections_cmd), modes=['root', 'config'])
+            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections test', self, self.test_lvssync), modes=['root'])
+            self.add_command(sysadmintoolkit.command.ExecCommand('synchronize loadbalancer lvs connections', self, self.lvssync_synchronize), modes=['root'])
+
+    def enter_mode(self, cmdprompt):
+        '''
+        '''
+        super(LVS, self).enter_mode(cmdprompt)
+
+        if cmdprompt.get_mode() is 'root':
+            self.refresh_vs_and_rs_cache()
+
+    def leave_mode(self, cmdprompt):
+        '''
+        '''
+        lastknowncmdprompt = self.cmdstack.pop()
+
+        self.logger.debug('Leaving mode %s (last known mode is %s)' % (cmdprompt.mode, lastknowncmdprompt.mode))
 
     def refresh_vs_and_rs_cache(self):
         self.logger.debug('Refreshing virtual/real server cache')
