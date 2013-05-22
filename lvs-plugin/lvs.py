@@ -90,15 +90,13 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         '''
         super(LVS, self).enter_mode(cmdprompt)
 
-        if cmdprompt.get_mode() is 'root':
+        if cmdprompt.get_mode() is not 'operator':
             self.refresh_vs_and_rs_cache()
 
     def clear_cache(self):
         '''
         '''
-        super(LVS, self).clear_cache()
-
-        if self.cmdstack[-1].get_mode() is 'root':
+        if self.cmdstack[-1].get_mode() is not 'operator':
             self.refresh_vs_and_rs_cache()
 
     def refresh_vs_and_rs_cache(self):
@@ -559,6 +557,8 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         '''
         Displays virtual servers to real servers mapping
         '''
+        self.refresh_vs_and_rs_cache()
+
         virtual_servers_keys = self.virtual_servers.keys()
         virtual_servers_keys.sort()
 
@@ -594,6 +594,8 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         Displays Real Server information
         '''
         line = user_input_obj.get_entered_command()
+
+        self.refresh_vs_and_rs_cache()
 
         if 'real-server' == line.split()[-1]:
             real_servers_keys = self.real_servers.keys()
