@@ -18,8 +18,6 @@ plugin_instance = None
 
 
 def get_plugin(logger, config):
-    '''
-    '''
     global plugin_instance
 
     if plugin_instance is None:
@@ -95,12 +93,13 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         if cmdprompt.get_mode() is 'root':
             self.refresh_vs_and_rs_cache()
 
-    def leave_mode(self, cmdprompt):
+    def clear_cache(self):
         '''
         '''
-        lastknowncmdprompt = self.cmdstack.pop()
+        super(LVS, self).clear_cache()
 
-        self.logger.debug('Leaving mode %s (last known mode is %s)' % (cmdprompt.mode, lastknowncmdprompt.mode))
+        if self.cmdstack[-1].get_mode() is 'root':
+            self.refresh_vs_and_rs_cache()
 
     def refresh_vs_and_rs_cache(self):
         self.logger.debug('Refreshing virtual/real server cache')
