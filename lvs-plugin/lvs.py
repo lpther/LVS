@@ -623,7 +623,13 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         print '  ipvsadm version: %s' % sysadmintoolkit.utils.get_status_output('ipvsadm -v', self.logger)[1]
         print
         print '  Name resolution: %s' % self.name_resolution
+        print
         print '  Clustering support: %s' % ('clustering' in self.plugin_set.get_plugins())
+
+        if 'clustering' in self.plugin_set.get_plugins():
+            print '    Nodeset: %s' % self.cluster_nodeset_name
+            print '      Nodes: %s' % self.plugin_set.get_plugins()['clustering'].get_nodeset(self.cluster_nodeset_name)
+
         print
 
         if self.syncid:
