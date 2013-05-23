@@ -461,7 +461,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         '''
         self.logger.debug('Displaying out-of-sync connections')
 
-        nodemap, all_connections = self.get_oos_connections()
+        (nodemap, all_connections) = self.get_oos_connections()
 
         return self.display_oos_connections(nodemap, all_connections)
 
@@ -516,7 +516,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         '''
         self.logger.info('Synchronizing LVS connections across the cluster')
 
-        nodemap, all_connections = self.get_oos_connections()
+        (nodemap, all_connections) = self.get_oos_connections()
 
         connections_to_sync_map = {}
 
@@ -551,7 +551,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         print 'Synchronization ended, validating...'
         print
 
-        return self.display_oos_connections_cmd(None, None)
+        return self.display_oos_connections_cmd(None)
 
     def display_virtual_servers_mapping(self, user_input_obj):
         '''
