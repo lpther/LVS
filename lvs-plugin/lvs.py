@@ -108,7 +108,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             vs = VirtualService(virtual_server_config)
 
             if vs.l3_addr not in self.virtual_servers:
-                self.virtual_servers[vs.l3_addr] = {'services': {}, 'l3_addr': vs.l3_addr}
+                self.virtual_servers[vs.l3_addr] = {'services': {}, 'l3_addr': vs.l3_addr, 'l3_addr_owner': 'unknown'}
 
             self.logger.debug('Adding virtual service %s to the cache' % str(vs).upper())
 
@@ -128,6 +128,20 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             self.real_servers[rs.l3_addr]['services']['%s:%s:%s:%s' % (rs.l4_port, rs.l4_proto, rs.vs_l3_addr, rs.vs_l4_port)] = rs
 
         self.refresh_dns_cache()
+        self.refresh_vip_location()
+
+    def refresh_vip_location(self):
+        if self.clustering_plugin:
+            buffer_nodes_list = self.clustering_plugin.run_cluster_command('ip addr show | grep secondary', \
+                                                          self.clustering_plugin.get_reachable_nodes(self.cluster_nodeset_name))
+
+            for (buffer, nodes) in buffer_nodes_list:
+                for line in buffer:
+                    ip = line.split()[1].split('/')[0]
+                    interface = line.split()[-1]
+
+                    if ip in self.virtual_servers:
+                        self.virtual_servers[ip]['l3_addr_owner'] = '%s:%s' % (nodes[0], interface)
 
     def refresh_dns_cache(self):
         if self.name_resolution:
@@ -242,7 +256,10 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
         vs_connections = re.findall(r"^[A-Z]* [A-F,0-9]* [A-F,0-9]* %s .*" % vs_ip_hex, connections, re.MULTILINE)
 
-        print '        Total Connections: %s' % len(vs_connections)
+        if self.clustering_plugin:
+            print '     Owner: %s' % self.virtual_servers[virtual_server]['l3_addr_owner'],
+
+        print '     Total Connections: %s' % len(vs_connections)
         print
 
         service_keys = self.virtual_servers[virtual_server]['services'].keys()
@@ -263,7 +280,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
             else:
                 service_str = '      %s' % (service.upper().rjust(9).replace(':', '/'))
 
-            print '%s             Scheduler: %s' % (service_str, lb_algo_map[vs_object.lb_algo].rjust(5)),
+            print '%s             Scheduler: %s' % (service_str, lb_algo_map[vs_object.lb_algo].ljust(20)),
 
             service_connections = re.findall("^%s [A-F,0-9]* [A-F,0-9]* %s %s .*" % \
                                              (vs_object.l4_proto.upper(), vs_ip_hex, l4_port_hex), '\n'.join(vs_connections), re.MULTILINE)
