@@ -1,4 +1,5 @@
-__version__ = '0.1.0a'
+__version__ = '0.1.0b'
+__website__ = 'https://github.com/lpther/LVS'
 
 import sysadmintoolkit
 import fcntl
@@ -27,6 +28,41 @@ def get_plugin(logger, config):
 
 
 class LVS(sysadmintoolkit.plugin.Plugin):
+    '''
+    Description
+    -----------
+
+    Provides a simple interface to view LVS connection information and virtual/real
+    servers information.
+
+    Requirements
+    ------------
+
+    The plugin call ipvsadm, and the calling user must be *root*. Plugin commands are only
+    available in root and config mode.
+
+    Clustering Features
+    -------------------
+
+    If the *clustering* plugin is detected, LVS cluster features are enabled.
+
+    The plugin implements a mechanism to synchronize out-of-sync LVS connections
+    across the cluster, and can display the owner of a VIP.
+
+    The default nodeset is used as the main nodeset.
+
+    Name Resolution
+    ---------------
+
+    The plugin will respect the name resolution attribute. Note that if clustering is enabled,
+    name resolution will be used by the clustering plugin.
+
+    Configuration
+    -------------
+
+    No configuration needed.
+
+    '''
     def __init__(self, logger, config):
         super(LVS, self).__init__('lvs', logger, config)
 
@@ -468,13 +504,13 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def display_connections_cmd(self, user_input_obj):
         '''
-        Displays connection table
+        Display connection table
         '''
         print sysadmintoolkit.utils.get_status_output('ipvsadm -L -n -c', self.logger)[1]
 
     def display_oos_connections_cmd(self, user_input_obj):
         '''
-        Displays out of sync connections between lvs in the cluster
+        Display out-of-sync connections between load balancers in the cluster
         '''
         self.logger.debug('Displaying out-of-sync connections')
 
@@ -529,7 +565,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def lvssync_synchronize(self, user_input_obj):
         '''
-        Synchronizes out-of-sync connections across the cluster
+        Synchronize out-of-sync connections across the cluster
         '''
         self.logger.info('Synchronizing LVS connections across the cluster')
 
@@ -572,7 +608,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def display_virtual_servers_mapping(self, user_input_obj):
         '''
-        Displays virtual servers to real servers mapping
+        Display virtual servers to real servers mapping
         '''
         self.refresh_vs_and_rs_cache()
 
@@ -587,7 +623,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def display_virtual_server_cmd(self, user_input_obj):
         '''
-        Displays Virtual Server information
+        Display Virtual Server information
         '''
         line = user_input_obj.get_entered_command()
 
@@ -608,7 +644,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def display_real_server_cmd(self, user_input_obj):
         '''
-        Displays Real Server information
+        Display Real Server information
         '''
         line = user_input_obj.get_entered_command()
 
@@ -632,7 +668,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
 
     def debug(self, user_input_obj):
         '''
-        Displays LVS configuration and state
+        Display LVS configuration and state
         '''
         print 'LVS plugin configuration and state:'
         print
