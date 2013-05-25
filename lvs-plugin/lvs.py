@@ -38,7 +38,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
     Requirements
     ------------
 
-    The plugin call ipvsadm, and the calling user must be *root*. Plugin commands are only
+    The plugin calls ipvsadm, and the calling user must be *root*. Plugin commands are only
     available in root and config mode.
 
     Clustering Features
