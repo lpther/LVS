@@ -1,6 +1,6 @@
 # LVS Plugin #
 
-A Sysadmin-Toolkit Plugin that can sort and display LVS cluster connections, and can launch an on-demand synchronization of the connection table when it is out-of-sync.
+A Sysadmin-Toolkit Plugin that can sort and display LVS cluster connections, and can launch an on-demand synchronization of the connection table when it is out-of-sync between nodes of the cluster.
 
 ## Plugin Description ##
 
