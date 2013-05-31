@@ -60,11 +60,14 @@ class LVS(sysadmintoolkit.plugin.Plugin):
     Configuration
     -------------
 
-    No configuration needed.
+    *lvs-sync-cps*
+      Maximum connections per second when synchronizing lvs connections
+
+      Default: 250
 
     '''
     def __init__(self, logger, config):
-        super(LVS, self).__init__('lvs', logger, config)
+        super(LVS, self).__init__('lvs', logger, config, version=__version__)
 
         self.clustering_plugin = None
 
