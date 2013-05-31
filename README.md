@@ -85,7 +85,8 @@ If the clustering plugin is loaded, testing and synchronizing out-of-sync connec
 	pro expire state       source             virtual            destination
 	
 	sysadmin-toolkit(root)# synchronize loadbalancer lvs connections test
-	Sending test client connection: TCP    0:30 ESTABLISHED   10.11.11.11:11111     10.22.22.22:22222     10.33.33.33:33333   MASQ NOOUTPUT
+	Sending test client connection: 
+        TCP    0:30 ESTABLISHED   10.11.11.11:11111     10.22.22.22:22222     10.33.33.33:33333   MASQ NOOUTPUT
 	
 	Validating all nodes received the connection...
 	

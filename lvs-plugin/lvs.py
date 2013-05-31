@@ -533,7 +533,7 @@ class LVS(sysadmintoolkit.plugin.Plugin):
         dummy_connection1.set_daddr_dport('10.33.33.33', 33333)
         dummy_connection1.set_timeout(30)
 
-        print 'Sending test client connection: %s' % dummy_connection1
+        print 'Sending test client connection: \n%s' % dummy_connection1
         print
 
         self.ipvssync.send_conn_list([dummy_connection1], self.ipvssync_cps)
